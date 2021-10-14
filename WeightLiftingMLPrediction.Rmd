@@ -1,0 +1,285 @@
+---
+title: "WeightLiftingMLPrediction"
+author: "Kevin Roche"
+date: "26/09/2021"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+    fig_height: 8
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+set.seed(824) # ripKobe
+```
+
+# Synopsis
+
+The following analysis uses data from the accelerometers on the belt, forearm, arm, and dumbbell to predict the class of the 20 participants in the test set after training on the 13,737 participants in the training set. Two prediction techniques, Decision Trees and XGBoost, are used to predict the manner in which the participants in the test set performed the exercise.
+
+Subjects were asked to perform barbell lifts correctly and incorrectly in 5 different ways:
+
+* Class A - Exactly according to the specification (correct)
+* Class B - Throwing the elbows to the front (mistake)
+* Class C - Lifting the dumbbell only halfway (mistake)
+* Class D - Lowering the dumbbell only halfway (mistake)
+* Class E - Throwing the hips to the front (mistake)
+
+Accelerometers were located on four locations:
+
+1. belt
+2. forearm
+3. arm
+4. dumbbell
+
+Further information about the dataset is available [here](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har). 
+
+# Setup
+
+```{r}
+## Load packages
+library(tidyverse)
+library(ggplot2)
+library(caret)
+library(xgboost)
+library(data.table)
+library(rattle)
+library(rpart)
+```
+
+# Data Processing
+
+First, we need to load the data into R. We'll call the raw data trainData and testData, and later split them into the cleaned sets we'll use for analysis - trainSet, validationSet, and testSet.
+
+```{r}
+## Load data
+trainUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testUrl <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+dir <- "/Users/kevinroche22/RData/WeightLiftingMLPrediction"
+setwd(dir)
+download.file(trainUrl, "pml-training.csv")
+download.file(testUrl, "pml-testing.csv")
+trainData <- read.csv("pml-training.csv", header = TRUE, sep = ",")
+testData <- read.csv("pml-testing.csv", header = TRUE, sep = ",")
+```
+
+Let's take a look at what we're working with.
+
+```{r}
+## Check Training Data
+dim(trainData)
+
+## Check Testing Data
+dim(testData)
+```
+
+So, the training data contains nearly 20k observations of 160 different variables, while the test data contains 20 observations of the same 160 variables. It looks like some of the variables have missing data, and there are blanks and division by 0's that aren't recorded as NA's. Let's convert all of the missing observations to NA and then see how many missing values each variable has.
+
+```{r}
+## Convert missing values to NA
+trainData[trainData==""] <- NA
+trainData[trainData=="#DIV/0!"] <- NA
+testData[testData==""] <- NA
+testData[testData=="#DIV/0!"] <- NA
+
+## View proportions
+trainData %>% summarise_each(funs(100*mean(is.na(.))))
+```
+
+Quite a few of the variables are nearly entirely missing (>97% NA). Let's remove them from the dataset, along with the metadata variables - which won't be used for prediction.
+
+```{r}
+## Remove metadata variables
+trainData <- trainData %>% 
+        select(-c(1:7))
+testData <- testData %>% 
+        select(-c(1:7))
+
+## Remove variables that are missing atleast half of their observations
+naVars <- trainData %>% 
+        map(function(x) mean(is.na(x)) > 0.50) # logical vector detailing whether or not each variable is missing more than 50% of its data
+trainData <- trainData[, naVars == FALSE] # remove variables that are missing more than 50% of their observations
+testSet <- testData[, naVars == FALSE]
+
+## Check to make sure only variables with no NA's are left. This leaves us with 53 variables.
+trainData %>% 
+        summarise_each(funs(sum(is.na(.))))
+```
+
+Let's also take a look at which of the remaining variables have zero or near-zero variance. 
+
+nearZeroVar() diagnoses predictors that have one unique value (i.e. are zero variance predictors) or predictors that are have both of the following characteristics: they have very few unique values relative to the number of samples and the ratio of the frequency of the most common value to the frequency of the second most common value is large.
+
+```{r}
+## Check if any of the remaining variables have zero or near-zero variance
+nearZeroVar(trainData, saveMetrics = TRUE)
+```
+
+None of the remaining variables have zero or near-zero variance, so no changes are made to the dataset.
+
+Lastly, we'll partition the training data into a training set (70% of obs) and a validation set (30% of obs).
+
+```{r}
+## Partition data
+inTrain <- createDataPartition(y=trainData$classe,
+                               p=0.7,
+                               list = FALSE)
+trainSet <- trainData[inTrain,]
+validationSet <- trainData[-inTrain,]
+```
+
+# Modeling
+
+Two techniques are used to predict the class of the participants in the test set.
+
+1. Decision Tree
+2. Extreme Gradient Boosting
+
+## Decision Tree
+
+Decision trees create a model that predicts the value of a target variable by learning simple decision rules inferred from the data features. Decision trees typically lack the predictive power of some other techniques, but they make feature importance clear and relations easy to see, so the results are worth investigating.
+
+```{r}
+## Decision tree
+system.time(dtFit <- rpart(classe ~ .,
+               method = "class",
+               data = trainSet)) # ~2.5s
+
+## Visualize decision tree
+fancyRpartPlot(dtFit)
+```
+
+The way in which the decision tree is formed is depicted above. Now we'll use the fitted model to predict the class's of the participants in the validation set.
+
+```{r}
+## Predict on validation set
+dtValidationPrediction <- predict(dtFit, newdata = validationSet, type = "class")
+
+## Evaluate 
+confusionMatrix(dtValidationPrediction, validationSet$classe)
+```
+
+We're able to predict the class of the validation set with 72.69% accuracy. Accuracy is defined as (number of correct predictions)/(total number of predictions).
+
+72.69% isn't a great accuracy score in this context, so we'll turn to XGBoost and see if we can build a better model.
+
+## XGBoost
+
+XGBoost is an implementation of gradient boosted decision trees designed for speed and performance. At the time of writing, it is widely considered the gold standard for building predictive models.
+
+XGBoost requires some data transformations to be made in order to run the model - ie. matrix format, outcome variable removed from training set, etc. Let's make those transformations now.
+
+Lastly, because we're using cross-validation, we'll use the entire set of training data without partitioning out part of it as a validation set.
+
+```{r}
+## Separate label/outcome variable (classe)
+classe <- trainData[, "classe"]
+lengthClasse <- length(levels(classe)) 
+levels(classe) <- 1:lengthClasse
+
+## XGBoost labels need to start at 0
+## ABCDE becomes 01234 in matrix form
+classeMatrix <- as.matrix(as.integer(classe)-1)
+
+# Remove outcome variables 
+trainData$classe <- NULL
+testSet$problem_id <- NULL
+
+# Convert data to matrix
+matrixTrainSet <- as.matrix(trainData)
+matrixTestSet <- as.matrix(testSet)
+```
+
+Next we'll set the parameters for the model - it's cleaner to do it separately.
+
+merror is chosen as the evaluation metric because it is considered the best evaluation metric for multiclass classification problems. It is calculated as (number of wrong cases)/(total cases).
+
+```{r}
+## Set parameters
+nRoundsCV <- 250 # number of iterations in cross-validation
+param <- list(objective = "multi:softprob", # multiclass classification
+              num_class = lengthClasse,     # number of classes (5 here)
+              eval_metric = "merror",       # evaluation metric 
+              nthread = 8,                  # threads to be used 
+              max_depth = 16,               # max depth of tree 
+              eta = 0.3,                    # step size shrinkage 
+              gamma = 0,                    # minimum loss reduction 
+              subsample = 1,                # data instances to grow tree 
+              colsample_bytree = 1,         # subsample ratio of columns
+              min_child_weight = 12         # min sum of instance weight
+              )
+```
+
+Now, we'll run XGBoost with 5-fold cross validation on the training data in an effort to determine the index with the best mean merror. 5-fold cross validation was selected because it strikes a nice balance between optimal model selection and runtime. 
+
+Then, we'll predict the classes of the participants in the training data using the cross-validation model and compare it to the actual values.
+
+```{r}
+## 5-fold CV
+system.time(cvModel <- xgb.cv(param=param, 
+                               data=matrixTrainSet, 
+                               label=classeMatrix, 
+                               nfold=5, 
+                               nrounds=nRoundsCV, 
+                               print.every.n = 10, 
+                               early.stop.round = 20,
+                               prediction=TRUE, 
+                               verbose=FALSE,
+                               maximize = FALSE))
+
+## Predict classe using cross-validation model
+cvPrediction <- matrix(cvModel$pred, 
+                       nrow = length(cvModel$pred)/lengthClasse, 
+                       ncol = lengthClasse) %>% 
+        max.col("last")
+
+## Confusion matrix
+confusionMatrix(factor(classeMatrix+1), factor(cvPrediction))
+```
+
+The cross-validation model is able to predict the class with 99.65% accuracy. This is substantially better than the decision tree model. Let's follow through and use the XGBoost model to predict the class of the test participants.
+
+We'll use the number of rounds that returned the lowest test merror mean in the cross validation model and use it to make the model that we're applying to the test data optimal.
+
+```{r}
+## Determine iteration with lowest test merror mean
+minErrorIndex <- which.min(cvModel$evaluation_log[, test_merror_mean])
+print(minErrorIndex) # shows which index had the lowest test merror mean
+
+## Train the real model with full data using the optimal test merror mean
+system.time(bestModel <- xgboost::xgboost(param=param, 
+                                 data=matrixTrainSet, 
+                                 label=classeMatrix, 
+                                 nrounds=minErrorIndex, 
+                                 verbose=FALSE,
+                                 maximize=FALSE, 
+                                 predict=TRUE))
+
+## Predict Test Data
+bestModelPrediction <- predict(bestModel, matrixTestSet)
+
+## Convert prediction from 01234 format back to ABCDE
+finalPrediction <- matrix(bestModelPrediction, 
+                          nrow=lengthClasse,
+                          ncol=length(bestModelPrediction)/lengthClasse) %>% 
+        t() %>%
+        max.col("last") 
+
+finalPrediction <- toupper(letters[finalPrediction])
+print(finalPrediction)
+```
+
+The optimal model is used to predict the class of the 20 test participants, listed above.
+
+Finally, let's take a look at the importance of the different features in the model. 
+
+xgb.ggplot.importance performs 1-D clustering of the importance values, with bar colors corresponding to different clusters that have somewhat similar importance values.
+
+```{r}
+## Feature importance
+importance_matrix <- xgb.importance(names(matrixTrainSet),model=bestModel)
+xgb.ggplot.importance(importance_matrix[1:20,]) 
+```
+
+According to the importance matrix, roll_belt is the most important feature.
